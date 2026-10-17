@@ -52,7 +52,7 @@ A rebuild-from-scratch record for my home server. If this machine dies, these no
  
 **OS:** Ubuntu Server 26.04.1 LTS (support through 2031)
 **ISO:** `ubuntu-26.04.1-live-server-amd64.iso` (renamed to `ubuntu.iso` locally)
-**ISO verified:** yes: `shasum -a 256` matched SHA256SUMS at releases.ubuntu.com/26.04/)_
+**ISO verified:** _(yes/no: `shasum -a 256` matched SHA256SUMS at releases.ubuntu.com/26.04/)_
  
 ### Making the install USB (on Mac)
 balenaEtcher failed (`requestMetadata is not a function` bug). Flashed with `dd` instead:
@@ -136,7 +136,7 @@ Swap:  4.0Gi total
 $ swapon --show
 /swap.img  file  4G
 ```
-4 GB swap file created by the installer. To do: lower swappiness so the HDD isn't used for swap unless needed.
+4 GB swap file created by the installer. Swappiness lowered to 10 (see Section 4, Step 5).
  
 ### Static IP via DHCP reservation
 Reserved **192.168.1.68** for the server's MAC address (`ip link show eno1` → `link/ether`) in the router admin page (192.168.1.1).
@@ -146,7 +146,161 @@ Why: the server's address must never change, or SSH and every service breaks.
  
 ## 4. Hardening
  
-_(next session: ufw firewall, fail2ban, unattended-upgrades, sshd lockdown, swappiness)_
+**Rule for firewall and SSH changes:** keep the current SSH session open and test in a second window. Fallback access is the Dell's own keyboard and screen.
+ 
+**Config pattern used throughout:** drop-in files instead of editing main config files, so package updates can't overwrite changes. Watch the precedence rule for each tool:
+- **sshd:** first value read wins (lower number wins)
+- **apt:** last value read wins (higher number wins)
+### Step 1: Firewall (ufw)
+`ufw` is a front end for the kernel firewall (nftables). Policy: deny all incoming by default, allow only what's needed.
+```bash
+sudo ufw status verbose                     # look before changing
+sudo ufw default deny incoming              # block anything not explicitly allowed
+sudo ufw default allow outgoing             # server can reach updates, DNS, time
+sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp comment 'SSH from LAN only'
+sudo ufw show added                         # dry run: review rules before enabling
+sudo ufw enable
+sudo ufw status verbose                     # verify end state
+```
+Why LAN-only SSH: defense in depth. Even if a port gets exposed by mistake, the internet can't reach SSH.
+ 
+**Expected** _(replace with actual output)_:
+```
+Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+22/tcp    ALLOW IN    192.168.1.0/24    # SSH from LAN only
+```
+**Verified:** new SSH session from Mac in a second window succeeded.
+ 
+**Notes for later:**
+- Tailscale will need its own SSH rule. SSH from outside the house does not work, by design.
+- **Docker bypasses ufw** for published container ports. Must be handled deliberately when Docker is installed.
+### Step 2: SSH lockdown
+Checked existing drop-ins first (`ls /etc/ssh/sshd_config.d/`, `sudo cat /etc/ssh/sshd_config.d/*.conf`). Named the file `10-` so it sorts before the installer's `50-cloud-init.conf`, because sshd uses the **first** value it reads.
+ 
+```bash
+sudo tee /etc/ssh/sshd_config.d/10-hardening.conf > /dev/null <<'EOF'
+# Homelab SSH hardening (runbook Section 4)
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+AllowUsers rezzqw
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+EOF
+sudo sshd -t                                # syntax check, no output = pass
+sudo systemctl restart ssh
+```
+ 
+| Setting | Why |
+|---|---|
+| PasswordAuthentication no | Keys only, passwords can be guessed |
+| KbdInteractiveAuthentication no | Closes the side door passwords can sneak back through |
+| PubkeyAuthentication yes | Explicit intent |
+| PermitRootLogin no | Log in as a user, use sudo, leaves an audit trail |
+| AllowUsers rezzqw | Allowlist, new accounts can't SSH in |
+| MaxAuthTries 3 | Disconnect after 3 failures per connection |
+| LoginGraceTime 30 | 30s to authenticate instead of 120s |
+| X11Forwarding no | No GUI, unused feature = attack surface |
+ 
+**Verify effective config** (what actually wins, not what was written):
+```bash
+sudo sshd -T | grep -Ei 'passwordauthentication|kbdinteractive|permitrootlogin|allowusers|maxauthtries|logingracetime|x11forwarding'
+```
+_(paste before and after output)_
+ 
+**Test 1 (good path):** new key-based SSH session from Mac. **Passed.**
+**Test 2 (bad path):** forced password attempt, refused with `Permission denied (publickey)`, never prompted for a password. **Passed.**
+```bash
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password rezzqw@192.168.1.68
+```
+ 
+### Step 3: Automatic security updates
+`unattended-upgrades` installs security updates daily.
+```bash
+systemctl status unattended-upgrades        # confirm active and enabled
+cat /etc/apt/apt.conf.d/20auto-upgrades     # both lines must be "1"
+```
+Override file (apt uses the **last** value read, so `52-` beats the defaults in `50-`):
+```bash
+sudo tee /etc/apt/apt.conf.d/52unattended-upgrades-local > /dev/null <<'EOF'
+// Homelab overrides (runbook Section 4)
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+```
+**Decision: automatic reboots at 4 AM, only when an update requires one.** Kernel patches don't take effect until reboot. Cost: anyone online at 4 AM gets disconnected briefly. Accepted.
+ 
+**Verify:**
+```bash
+sudo unattended-upgrade --dry-run --debug   # look for "Allowed origins" with -security, no errors
+sudo apt-config dump | grep -i automatic-reboot   # should show "true" and "04:00"
+```
+**Verified:** all matched.
+**Logs:** `/var/log/unattended-upgrades/unattended-upgrades.log`
+ 
+### Step 4: fail2ban
+Watches logs, bans IPs with too many failed logins by adding a firewall rule.
+ 
+**Why it's here even though SSH is key-only and LAN-only:** the LAN isn't fully trusted (a compromised IoT device is inside the firewall), it matters more once services are exposed, and it's practice with automated intrusion prevention.
+ 
+```bash
+sudo apt install -y fail2ban python3-systemd    # python3-systemd lets it read the journal
+```
+Config in `jail.local`. **Never edit `jail.conf`**, package updates overwrite it.
+```bash
+sudo tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
+# Homelab fail2ban config (runbook Section 4)
+[DEFAULT]
+backend = systemd
+banaction = ufw
+bantime = 1h
+bantime.increment = true
+findtime = 10m
+maxretry = 5
+ 
+[sshd]
+enabled = true
+EOF
+sudo fail2ban-client -t                     # config test
+sudo systemctl enable --now fail2ban
+sudo systemctl restart fail2ban
+sudo fail2ban-client status sshd            # jail running, 0 banned
+```
+ 
+| Setting | Why |
+|---|---|
+| backend = systemd | Login events are in the systemd journal on modern Ubuntu |
+| banaction = ufw | Bans show up in `ufw status`, one firewall to check |
+| bantime = 1h | Ban length |
+| bantime.increment = true | Repeat offenders get longer bans |
+| findtime = 10m, maxretry = 5 | 5 failures in 10 minutes = ban |
+ 
+**Self-ban test (bad path), done at the Dell's keyboard:**
+```bash
+# On Mac: 6 fake login attempts
+for i in 1 2 3 4 5 6; do ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password fakeuser@192.168.1.68; done
+# On Dell: confirm the ban
+sudo fail2ban-client status sshd
+sudo ufw status
+# On Dell: unban (prints the number of IPs unbanned, so "1" = success)
+sudo fail2ban-client set sshd unbanip <Mac-IP>
+```
+**Result:** Mac IP banned and shown in ufw, unban returned `1`, SSH from Mac restored. **Passed.**
+**Note:** ban history is kept, and `bantime.increment` is on, so the Mac's next accidental ban will last longer than 1 hour.
+ 
+### Step 5: Swappiness
+Swap is on a slow HDD. Lowering swappiness from 60 to 10 makes Linux drop file cache before moving program memory to swap. Swap stays on as a safety net.
+```bash
+echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swappiness.conf
+sudo sysctl --system                        # apply now without reboot
+cat /proc/sys/vm/swappiness                 # live kernel value, should print 10
+```
+**Verified:** prints `10` after a full reboot.
  
 ---
  
@@ -178,6 +332,11 @@ _(next session: ufw firewall, fail2ban, unattended-upgrades, sshd lockdown, swap
 **Notes:** `sr0` is the empty DVD drive, a red herring. The real error was the installer losing the USB stick.
 **Fix:** Answered No to netboot, powered off, moved USB from blue USB 3.0 port to **black USB 2.0 port**. Booted fine.
  
+### Procedure: Locked out of SSH
+1. Go to the Dell, open the lid, log in on its keyboard.
+2. Banned by fail2ban? `sudo fail2ban-client status sshd`, then `sudo fail2ban-client set sshd unbanip <IP>`.
+3. Blocked by firewall? `sudo ufw status numbered`, check the SSH rule exists and covers your IP.
+4. SSH config broken? `sudo sshd -t` to find the error, fix the file in `/etc/ssh/sshd_config.d/`, `sudo systemctl restart ssh`.
 ---
  
 ## Changelog
@@ -186,4 +345,4 @@ _(next session: ufw firewall, fail2ban, unattended-upgrades, sshd lockdown, swap
 |---|---|
 | 2026-10-16 | Hardware checked, BIOS configured |
 | 2026-10-17 | Ubuntu Server 26.04.1 installed, SSH key-only access, lid/timezone/DHCP reservation configured |
- 
+| 2026-10-17 | Hardening: ufw (LAN-only SSH), sshd lockdown, unattended-upgrades with 4 AM auto-reboot, fail2ban, swappiness 10 |
