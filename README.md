@@ -52,7 +52,7 @@ A rebuild-from-scratch record for my home server. If this machine dies, these no
  
 **OS:** Ubuntu Server 26.04.1 LTS (support through 2031)
 **ISO:** `ubuntu-26.04.1-live-server-amd64.iso` (renamed to `ubuntu.iso` locally)
-**ISO verified:** _(yes/no: `shasum -a 256` matched SHA256SUMS at releases.ubuntu.com/26.04/)_
+**ISO verified:** yes: `shasum -a 256` matched SHA256SUMS at releases.ubuntu.com/26.04/)_
  
 ### Making the install USB (on Mac)
 balenaEtcher failed (`requestMetadata is not a function` bug). Flashed with `dd` instead:
