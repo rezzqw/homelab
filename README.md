@@ -362,6 +362,78 @@ The LAN rule stays as a fallback in case Tailscale is down.
 
 ---
 
+## 6. Monitoring (dead-man's switch)
+
+**What:** the server pings healthchecks.io every 5 minutes. If pings stop, healthchecks.io alerts my phone. **Silence is the alarm**, so one mechanism catches power loss, crashes, a frozen OS, network or DNS failure, and an unplugged cable. No inbound ports needed.
+
+### healthchecks.io check
+- Name: `homelab-heartbeat`
+- **Period: 5 min, Grace: 10 min.** Grace covers router reboots and the 4 AM auto-reboot without false alarms.
+- Alerts: SMS, notify on both down and up. Account has 2FA.
+
+### Secret handling
+The ping URL is a secret. Anyone with it can send fake "alive" pings. **It is not in this repo.**
+```bash
+sudo mkdir -p /etc/homelab
+sudo install -m 600 /dev/null /etc/homelab/heartbeat.env   # create locked-down before writing the secret
+sudo nano /etc/homelab/heartbeat.env                       # contents: HC_URL=https://hc-ping.com/<uuid>
+sudo ls -l /etc/homelab/heartbeat.env                      # verify: -rw------- root root
+```
+Used an editor instead of `echo` so the URL never lands in shell history.
+
+### systemd service
+```bash
+sudo tee /etc/systemd/system/heartbeat.service > /dev/null <<'EOF'
+[Unit]
+Description=Send heartbeat ping to healthchecks.io
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/homelab/heartbeat.env
+ExecStart=/usr/bin/curl -fsS -m 10 --retry 5 -o /dev/null ${HC_URL}
+DynamicUser=yes
+EOF
+```
+- `After=network-online.target`: don't ping before the network is up
+- `EnvironmentFile`: secret loaded by systemd as root, never readable by others
+- `DynamicUser=yes`: curl runs as a throwaway unprivileged user (least privilege)
+
+### systemd timer
+```bash
+sudo tee /etc/systemd/system/heartbeat.timer > /dev/null <<'EOF'
+[Unit]
+Description=Run heartbeat every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnCalendar=*:0/5
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now heartbeat.timer
+```
+- `OnCalendar=*:0/5`: every 5 minutes on the wall clock
+- `OnBootSec=1min`: quick "back up" ping after a reboot
+
+### Verification
+```bash
+systemctl list-timers heartbeat.timer           # NEXT must show a real time, never n/a
+journalctl -u heartbeat.service -n 20 --no-pager   # a run every 5 minutes
+```
+- Dashboard green, runs logged every 5 minutes. **Passed.**
+- **Cable test:** unplugged Ethernet, journal showed failed curl runs every 5 minutes, down alert received. Plugged back in, up alert received. **Passed.**
+- **Power-loss test (Wake on AC):** `sudo poweroff`, unplugged charger, plugged back in. Laptop booted by itself, heartbeat check went green. Proves the BIOS Wake on AC setting and full outage recovery end to end. **Passed.**
+
+### Limitations
+- healthchecks.io is a third party. If it's down, no alerts.
+- This proves the server is alive and online. It does not prove individual services (like Minecraft) are working. Per-service checks come later.
+
+---
+
 ## Troubleshooting log
 
 ### 2026-10-17: New domains won't resolve on home network
@@ -391,6 +463,13 @@ The LAN rule stays as a fallback in case Tailscale is down.
 **Notes:** `sr0` is the empty DVD drive, a red herring. The real error was the installer losing the USB stick.
 **Fix:** Answered No to netboot, powered off, moved USB from blue USB 3.0 port to **black USB 2.0 port**. Booted fine.
 
+### 2026-10-17: Heartbeat test passed for the wrong reason
+**Symptom:** Cable-unplug test produced a down alert, but no up alert after reconnecting.
+**Diagnosis:** `journalctl -u heartbeat.service` showed only one run (the manual one). The timer had never fired.
+**Cause:** Timer used `OnUnitActiveSec=5min`, which counts from the last time the *timer* started the service. `OnBootSec` was already in the past when the timer was enabled, and a manual start doesn't count, so the timer's next run was "never" (`list-timers` NEXT = `n/a`). The down alert was caused by no pings at all, not by the cable.
+**Fix:** Switched to `OnCalendar=*:0/5` (wall-clock schedule, always has a next run). Re-ran the cable test and confirmed failed runs in the journal while unplugged.
+**Lesson:** A test can produce the expected result for the wrong reason. Confirm the cause, not only the outcome. Read every field of verification output (`n/a` was the warning sign).
+
 ### Procedure: Locked out of SSH
 1. Go to the Dell, open the lid, log in on its keyboard.
 2. Banned by fail2ban? `sudo fail2ban-client status sshd`, then `sudo fail2ban-client set sshd unbanip <IP>`.
@@ -407,3 +486,4 @@ The LAN rule stays as a fallback in case Tailscale is down.
 | 2026-10-17 | Ubuntu Server 26.04.1 installed, SSH key-only access, lid/timezone/DHCP reservation configured |
 | 2026-10-17 | Hardening: ufw (LAN-only SSH), sshd lockdown, unattended-upgrades with 4 AM auto-reboot, fail2ban, swappiness 10 |
 | 2026-10-17 | Tailscale: remote SSH from anywhere with zero open router ports, key expiry disabled on server |
+| 2026-10-17 | Monitoring: healthchecks.io dead-man's switch via systemd timer, fixed OnUnitActiveSec bug |
