@@ -434,6 +434,122 @@ journalctl -u heartbeat.service -n 20 --no-pager   # a run every 5 minutes
 
 ---
 
+## 7. Docker
+
+**What:** runs services in isolated containers that share the host kernel. Services are defined in Compose files (YAML) so they can be committed and rebuilt.
+
+**Known risk (from Docker's own install docs):** ports published by Docker **bypass ufw**. Docker inserts its own firewall rules ahead of ufw's. Handled in Step 2.
+
+### Step 1: Install from Docker's official apt repo
+```bash
+# Remove unofficial/conflicting packages (none present on fresh install)
+sudo apt remove $(dpkg --get-selections docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc | cut -f1)
+
+# Signing key
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+gpg --show-keys /etc/apt/keyrings/docker.asc
+```
+**Key fingerprint verified:** `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`
+
+```bash
+# Repository (unquoted EOF on purpose so $(...) expands to codename and arch)
+sudo tee /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+cat /etc/apt/sources.list.d/docker.sources   # verify: Suites resolute, Architectures amd64, no $ left
+
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl status docker                 # active (running)
+sudo docker run --rm hello-world             # success message
+```
+**Heredoc quoting:** `<<'EOF'` writes text literally. `<<EOF` lets the shell expand `$(...)` first. This file needs the unquoted form.
+
+**Decision: user NOT added to the `docker` group.** Docker group membership is root-equivalent (a container can mount the host filesystem) and bypasses sudo logging. All Docker commands use `sudo docker`.
+
+### Step 2: Safe daemon defaults
+```bash
+sudo tee /etc/docker/daemon.json > /dev/null <<'EOF'
+{
+  "ip": "127.0.0.1",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "live-restore": true,
+  "no-new-privileges": true
+}
+EOF
+sudo dockerd --validate --config-file /etc/docker/daemon.json   # configuration OK
+sudo systemctl restart docker
+sudo docker info | grep -iE 'logging driver|live restore'      # json-file, true
+```
+
+| Setting | Why |
+|---|---|
+| `"ip": "127.0.0.1"` | Ports published without an IP bind to localhost only. Forgotten ports stay private (fail safe). Closes the ufw bypass by default. |
+| `log-opts` 10m x 3 | Container logs otherwise grow forever and can fill the disk |
+| `live-restore` | Containers keep running through Docker restarts and updates |
+| `no-new-privileges` | Blocks privilege escalation via setuid binaries inside containers. **First suspect if an image misbehaves.** |
+
+### Firewall bypass test
+**Test A: prove the hole exists** (port forced to all interfaces, no ufw rule for 8080):
+```bash
+sudo docker run -d --rm --name bypass-test -p 0.0.0.0:8080:80 nginx:alpine
+sudo ufw status                                   # no 8080 rule
+# From Mac:
+curl -I http://192.168.1.68:8080                  # 200 OK: traffic bypassed ufw
+sudo docker stop bypass-test
+```
+**Result:** Mac reached the container despite no ufw rule. **Bypass confirmed.**
+
+**Test B: prove the default closes it** (port published without an IP):
+```bash
+sudo docker run -d --rm --name bypass-test -p 8080:80 nginx:alpine
+sudo ss -tlnp | grep 8080                         # 127.0.0.1:8080 only, no 0.0.0.0 or [::]
+# From Mac:
+curl -I --max-time 5 http://192.168.1.68:8080     # fails
+# On server:
+curl -I http://127.0.0.1:8080                     # 200 OK
+sudo docker stop bypass-test
+```
+**Result:** bound to localhost only, unreachable from Mac, reachable on server. **Passed.**
+
+**Rule for all Compose files:** every published port gets an **explicit IP**.
+- `192.168.1.68:<port>:<port>` = LAN only
+- `<tailnet IP>:<port>:<port>` = Tailscale only
+- Never `0.0.0.0` without a written reason
+
+### Step 3: Automatic Docker updates
+unattended-upgrades only installs from Ubuntu's repos by default, so Docker would never update.
+```bash
+apt-cache policy | grep -B1 -A1 docker            # found o=Docker, l=Docker CE
+sudo tee /etc/apt/apt.conf.d/53unattended-upgrades-docker > /dev/null <<'EOF'
+// Allow Docker updates (runbook Section 7)
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Docker,label=Docker CE";
+};
+EOF
+sudo unattended-upgrade --dry-run --debug 2>&1 | grep -i -A3 'allowed origins'
+```
+**Verified:** Docker origin listed alongside Ubuntu's `-security` origins.
+
+**apt config precedence, complete picture:**
+- Single values: last file read wins
+- Lists: entries from later files are **added**, not replaced
+
+**Decision:** auto-update Docker. A rare breaking update is a smaller risk than an unpatched container runtime, and `live-restore` keeps containers running through the restart.
+
+---
+
 ## Troubleshooting log
 
 ### 2026-10-17: New domains won't resolve on home network
@@ -487,3 +603,4 @@ journalctl -u heartbeat.service -n 20 --no-pager   # a run every 5 minutes
 | 2026-10-17 | Hardening: ufw (LAN-only SSH), sshd lockdown, unattended-upgrades with 4 AM auto-reboot, fail2ban, swappiness 10 |
 | 2026-10-17 | Tailscale: remote SSH from anywhere with zero open router ports, key expiry disabled on server |
 | 2026-10-17 | Monitoring: healthchecks.io dead-man's switch via systemd timer, fixed OnUnitActiveSec bug |
+| 2026-10-18 | Docker: official repo, safe daemon defaults, ufw bypass demonstrated and closed, auto-updates |
